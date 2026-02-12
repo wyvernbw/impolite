@@ -1,26 +1,20 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{io::Read, os::unix::net::UnixStream, path::PathBuf, sync::Arc};
 
-use anyhow::anyhow;
-use facet::Facet;
+use color_eyre::{Result, Section, eyre::Context};
 use freedesktop_desktop_entry::{DesktopEntry, desktop_entries, get_languages_from_env};
-use tokio::net::TcpStream;
-use tokio_stream::StreamExt;
-use tokio_util::{
-    bytes::Bytes,
-    codec::{Framed, LengthDelimitedCodec},
-};
+use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 use crate::Str;
 
-pub async fn get_sessions() -> Vec<DesktopEntry> {
+pub fn get_sessions() -> Vec<DesktopEntry> {
     let locales = get_languages_from_env();
 
     desktop_entries(&locales)
 }
 
-#[derive(Facet)]
-#[repr(u8)]
-#[facet(tag = "type", rename_all = "snake_case")]
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     CreateSession {
         username: Str,
@@ -33,24 +27,21 @@ pub enum Request {
     CancelSession,
 }
 
-#[derive(Facet)]
-#[repr(u8)]
-#[facet(tag = "type", rename_all = "snake_case")]
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Success,
     Error {
         error_type: ErrorType,
         description: Str,
     },
-    #[facet(transparent)]
     AuthMessage {
         auth_message_type: AuthMessageType,
         auth_message: Str,
     },
 }
 
-#[derive(Facet)]
-#[repr(u8)]
+#[derive(Serialize, Deserialize)]
 pub enum AuthMessageType {
     Visible,
     Secret,
@@ -58,38 +49,41 @@ pub enum AuthMessageType {
     Error,
 }
 
-#[derive(Facet)]
-#[repr(u8)]
+#[derive(Serialize, Deserialize)]
 pub enum ErrorType {
     AuthError,
     Error,
 }
 
-pub fn greetd_socket_addr() -> anyhow::Result<SocketAddr> {
-    let addr = std::env::var("GREETD_SOCK")?;
+#[instrument]
+pub fn greetd_socket_addr() -> Result<PathBuf> {
+    let addr = std::env::var("GREETD_SOCK")
+        .wrap_err("failed to read GREETD_SOCK from env")
+        .suggestion(
+            "Greetd must be running for Impolite to work. You might already be logged in.",
+        )?;
     let addr = addr.parse()?;
     Ok(addr)
 }
 
-pub async fn greetd_connect() -> anyhow::Result<tokio::net::TcpStream> {
+pub fn greetd_connect() -> Result<UnixStream> {
     let addr = greetd_socket_addr()?;
-    let conn = tokio::net::TcpStream::connect(addr).await?;
+    let conn = UnixStream::connect(addr)?;
     Ok(conn)
 }
 
-pub async fn greetd_decode(
-    transport: &mut Framed<TcpStream, LengthDelimitedCodec>,
-) -> Option<anyhow::Result<Response>> {
-    let bytes = transport.next().await?;
-    match bytes {
-        Ok(bytes) => Some(greetd_decode_impl(&bytes)),
-        Err(err) => Some(Err(anyhow!(err))),
-    }
+pub fn greetd_decode(transport: &mut impl Read) -> Result<Response> {
+    let mut len_buf = [0u8; 4];
+    transport.read_exact(&mut len_buf)?;
+    let len = u32::from_ne_bytes(len_buf);
+    let mut buf = vec![0u8; len as _];
+    transport.read_exact(&mut buf)?;
+    greetd_decode_impl(&buf)
 }
 
-fn greetd_decode_impl(bytes: &[u8]) -> anyhow::Result<Response> {
+fn greetd_decode_impl(bytes: &[u8]) -> Result<Response> {
     let string = std::str::from_utf8(bytes)?;
-    let res = facet_json::from_str(string)?;
+    let res = serde_json::from_str(string)?;
     Ok(res)
 }
 
@@ -98,19 +92,19 @@ mod tests {
     use crate::greetd::{Request, Response};
 
     #[test]
-    fn serialize_messages() -> anyhow::Result<()> {
+    fn serialize_messages() -> color_eyre::Result<()> {
         let msg = Request::CreateSession {
             username: "Bingus".into(),
         };
 
         assert_eq!(
-            facet_json::to_string(&msg)?,
+            serde_json::to_string(&msg)?,
             r#"{"type":"create_session","username":"Bingus"}"#
         );
 
         let msg = Response::Success;
 
-        assert_eq!(facet_json::to_string(&msg)?, r#"{"type":"success"}"#);
+        assert_eq!(serde_json::to_string(&msg)?, r#"{"type":"success"}"#);
 
         Ok(())
     }

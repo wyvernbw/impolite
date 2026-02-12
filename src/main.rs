@@ -1,25 +1,55 @@
 #![feature(associated_type_defaults)]
-#![expect(unexpected_cfgs)]
 
-use std::sync::Arc;
+use color_eyre::Result;
+use color_eyre::eyre::Context;
+use color_eyre::eyre::eyre;
+use std::io::BufReader;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, mpsc};
+use tracing::instrument;
 
-use flume::{Receiver, Sender};
+use tracing_error::ErrorLayer;
+use tracing_subscriber::prelude::*;
+
 use ratatui::crossterm::event;
-use tokio_stream::StreamExt;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-use crate::impolite_app::{Component, Impolite, ImpoliteState};
+use crate::impolite::{Component, Impolite, ImpoliteState};
 
 pub mod greetd;
-pub mod impolite_app;
+#[path = "impolite/impolite.rs"]
+pub mod impolite;
+#[path = "lipgloss-colors.rs"]
 pub mod lipgloss_colors;
 
 pub type Str = Arc<str>;
 
-#[tokio::main(flavor = "local")]
-async fn main() -> anyhow::Result<()> {
-    app().await?;
-    Ok(())
+fn main() -> Result<()> {
+    let subscriber = tracing_subscriber::Registry::default()
+        // any number of other subscriber layers may be added before or
+        // after the `ErrorLayer`...
+        .with(ErrorLayer::default());
+
+    // set the subscriber as the default for the application
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    color_eyre::install()?;
+
+    app()
+}
+
+#[derive(Debug)]
+pub struct AppArgs {
+    debug: bool,
+}
+
+impl AppArgs {
+    fn try_new() -> Result<Self> {
+        let mut pargs = pico_args::Arguments::from_env();
+        Ok(Self {
+            debug: pargs.contains(["-d", "--debug"]),
+        })
+    }
 }
 
 pub enum AppMsg {
@@ -27,60 +57,72 @@ pub enum AppMsg {
     GreetdEvent(greetd::Response),
 }
 
-async fn app() -> anyhow::Result<()> {
-    let (event_tx, event_rx) = flume::unbounded::<AppMsg>();
-    let event_loop = tokio::task::spawn_local(event_loop(event_tx));
-    let render_loop = tokio::task::spawn_local(render_loop(event_rx));
-    render_loop.await??;
-    if event_loop.is_finished() {
-        event_loop.await??;
+fn app() -> Result<()> {
+    let args = AppArgs::try_new().wrap_err("failed to parse cli arguments")?;
+    let args = Box::leak(Box::new(args));
+
+    let (event_tx, event_rx) = mpsc::channel::<AppMsg>();
+    let event_thread = std::thread::spawn(|| event_loop(args, event_tx));
+    let render_thread = std::thread::spawn(|| render_loop(args, event_rx));
+
+    render_thread
+        .join()
+        .map_err(|_| eyre!("thread join error"))??;
+
+    if event_thread.is_finished() {
+        event_thread
+            .join()
+            .map_err(|_| eyre!("thread join error"))??;
     }
+
     Ok(())
 }
 
-async fn event_loop(event_tx: Sender<AppMsg>) -> anyhow::Result<()> {
-    let mut event_stream = event::EventStream::new();
-    let greetd_conn = greetd::greetd_connect().await;
-    match greetd_conn {
-        Ok(greetd_conn) => {
-            let codec = LengthDelimitedCodec::new();
-            let mut greetd_transport = Framed::new(greetd_conn, codec);
+#[instrument(ret, err, skip(event_tx))]
+fn event_loop(args: &'static AppArgs, event_tx: Sender<AppMsg>) -> Result<()> {
+    let socket = greetd::greetd_connect();
 
-            loop {
-                tokio::select! {
-                    Some(Ok(event)) = event_stream.next() => {
-                        event_tx.send_async(AppMsg::TermEvent(event)).await?;
-                    }
-                    Some(Ok(greetd_res)) = greetd::greetd_decode(&mut greetd_transport) => {
-                        event_tx.send_async(AppMsg::GreetdEvent(greetd_res)).await?;
-                    }
+    let socket = match (socket, args.debug) {
+        (Ok(socket), _) => Some(socket),
+        (Err(_), true) => None,
+        (Err(report), false) => return Err(report),
+    };
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while let Ok(event) = ratatui::crossterm::event::read() {
+                if event_tx.send(AppMsg::TermEvent(event)).is_err() {
+                    break;
                 }
             }
-        }
-        Err(err) => {
-            tracing::warn!("error connecting to greetd: {err} - running without connection");
-            loop {
-                tokio::select! {
-                    Some(Ok(event)) = event_stream.next() => {
-                        event_tx.send_async(AppMsg::TermEvent(event)).await?;
+        });
+
+        if let Some(socket) = socket {
+            scope.spawn(|| {
+                let mut transport = BufReader::new(socket);
+                while let Ok(res) = greetd::greetd_decode(&mut transport) {
+                    if event_tx.send(AppMsg::GreetdEvent(res)).is_err() {
+                        break;
                     }
                 }
-            }
-        }
-    }
+            });
+        };
+    });
+    Ok(())
 }
 
-async fn render_loop(event_rx: Receiver<AppMsg>) -> anyhow::Result<()> {
+#[instrument(ret, err)]
+fn render_loop(args: &'static AppArgs, event_rx: Receiver<AppMsg>) -> color_eyre::Result<()> {
     let mut term = ratatui::init();
 
-    let app = Impolite::new();
+    let app = Impolite::new(args);
     let mut app_state = ImpoliteState::new();
 
     term.draw(|frame| {
         app.render(frame.area(), frame.buffer_mut(), &mut app_state);
     })?;
 
-    while let Ok(msg) = event_rx.recv_async().await {
+    while let Ok(msg) = event_rx.recv() {
         app.update(msg, &mut app_state);
         if app_state.exit_flag {
             break;

@@ -1,12 +1,12 @@
-use crossterm::event::KeyModifiers;
+use ratatui::crossterm::event::KeyModifiers;
 use ratatui::prelude::style::palette::tailwind as tw;
 use ratatui::prelude::*;
 use ratatui::style::Styled;
 use ratatui::widgets::Block;
 use ratatui::{buffer::Buffer, layout::Rect};
 
-use crate::AppMsg;
 use crate::lipgloss_colors::PALETTE;
+use crate::{AppArgs, AppMsg};
 
 pub trait Component {
     type State;
@@ -40,20 +40,14 @@ macro_rules! key {
     };
 }
 
-pub struct Impolite;
+pub struct Impolite(&'static AppArgs);
 pub struct ImpoliteState {
     pub exit_flag: bool,
 }
 
 impl Impolite {
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for Impolite {
-    fn default() -> Self {
-        Self::new()
+    pub const fn new(args: &'static AppArgs) -> Self {
+        Self(args)
     }
 }
 
@@ -74,7 +68,6 @@ impl Component for Impolite {
 
     fn update(&self, event: AppMsg, state: &mut Self::State) {
         match event {
-            #[cfg(debug_assertions)]
             AppMsg::TermEvent(key!(Char('c' | 'C'), KeyModifiers::CONTROL)) => {
                 state.exit_flag = true;
             }
@@ -109,7 +102,11 @@ impl Component for InputComponent {
                 .spacing(2)
                 .areas(area);
         " Label "
-            .set_style(Style::new().bg(PALETTE[0][0]).fg(Color::from_u32(0)))
+            .set_style(
+                Style::new()
+                    .bg(PALETTE[0][0])
+                    .fg(Color::from_u32(0x00ffffff)),
+            )
             .render(label_area, buf);
         "im typing here".render(input_area, buf);
     }
