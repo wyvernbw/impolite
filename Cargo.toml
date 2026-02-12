@@ -10,10 +10,11 @@ facet = { version = "0.43.2", default-features = false }
 facet-json = { version = "0.43.2", features = ["tokio"] }
 flume = { version = "0.12.0", default-features = false, features = ["async"] }
 freedesktop-desktop-entry = "0.8.1"
-ratatui = "0.30.0"
+ratatui = { version = "0.30.0", features = ["palette"] }
 tokio = { version = "1.49.0", default-features = false, features = ["io-std", "macros", "net", "rt"] }
 tokio-stream = "0.1.18"
 tokio-util = { version = "0.7.18", features = ["codec"] }
+tracing = "0.1.44"
 
 [profile.release]
 opt-level = "s"

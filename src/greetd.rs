@@ -88,7 +88,7 @@ pub async fn greetd_decode(
 }
 
 fn greetd_decode_impl(bytes: &[u8]) -> anyhow::Result<Response> {
-    let string = std::str::from_utf8(&bytes)?;
+    let string = std::str::from_utf8(bytes)?;
     let res = facet_json::from_str(string)?;
     Ok(res)
 }
