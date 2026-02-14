@@ -1,3 +1,7 @@
+#![feature(const_default)]
+#![feature(derive_const)]
+#![feature(gethostname)]
+#![feature(const_trait_impl)]
 #![feature(associated_type_defaults)]
 
 use color_eyre::Result;
@@ -52,6 +56,7 @@ impl AppArgs {
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum AppMsg {
     TermEvent(event::Event),
     GreetdEvent(greetd::Response),
@@ -119,7 +124,7 @@ fn render_loop(args: &'static AppArgs, event_rx: Receiver<AppMsg>) -> color_eyre
     let mut app_state = ImpoliteState::new();
 
     term.draw(|frame| {
-        app.render(frame.area(), frame.buffer_mut(), &mut app_state);
+        app.render(frame.area(), frame, &mut app_state);
     })?;
 
     while let Ok(msg) = event_rx.recv() {
@@ -128,7 +133,7 @@ fn render_loop(args: &'static AppArgs, event_rx: Receiver<AppMsg>) -> color_eyre
             break;
         }
         term.draw(|frame| {
-            app.render(frame.area(), frame.buffer_mut(), &mut app_state);
+            app.render(frame.area(), frame, &mut app_state);
         })?;
     }
     ratatui::restore();

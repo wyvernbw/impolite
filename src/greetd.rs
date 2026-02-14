@@ -13,7 +13,7 @@ pub fn get_sessions() -> Vec<DesktopEntry> {
     desktop_entries(&locales)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     CreateSession {
@@ -27,7 +27,7 @@ pub enum Request {
     CancelSession,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Success,
@@ -41,7 +41,7 @@ pub enum Response {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub enum AuthMessageType {
     Visible,
     Secret,
@@ -49,7 +49,7 @@ pub enum AuthMessageType {
     Error,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub enum ErrorType {
     AuthError,
     Error,
