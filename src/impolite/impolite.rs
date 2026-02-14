@@ -1,8 +1,7 @@
+use std::borrow::Cow;
 use std::net::hostname;
 
 use ratatui::crossterm::event::{Event, KeyModifiers};
-use ratatui::layout::Rect;
-use ratatui::macros::ratatui_core;
 use ratatui::prelude::*;
 use ratatui::style::Styled;
 use ratatui::widgets::{Block, Padding, Paragraph};
@@ -67,10 +66,13 @@ impl Field {
         }
     }
 
-    fn label(&self) -> &'static str {
-        match self {
-            Field::UsernameField => " Username ",
-            Field::PasswordField => " Password ",
+    fn label(&self, is_focused: Option<bool>) -> &'static str {
+        let is_focused = is_focused.unwrap_or_default();
+        match (self, is_focused) {
+            (Field::UsernameField, false) => "  Username ",
+            (Field::PasswordField, false) => "  Password ",
+            (Field::UsernameField, true) => "| Username",
+            (Field::PasswordField, true) => "| Password",
         }
     }
 }
@@ -97,11 +99,13 @@ impl Impolite {
 
 impl ImpoliteState {
     pub fn new() -> Self {
+        let host = hostname()
+            .map(|string| string.display().to_string())
+            .unwrap_or("machine".into());
+        let host = format!(" {host} ");
         Self {
             exit_flag: false,
-            hostname: hostname()
-                .map(|string| string.display().to_string().into())
-                .unwrap_or("machine".into()),
+            hostname: host.into(),
             focus: Field::default(),
             prompts: PromptState::default(),
         }
@@ -165,12 +169,7 @@ impl Component for Impolite {
 
     fn render(&self, area: Rect, frame: &mut Frame<'_>, state: &mut Self::State) {
         let area = Block::new().padding(Padding::uniform(1)).inner(area);
-        let [_, area, _] = Layout::horizontal([Constraint::Ratio(1, 3)].repeat(3))
-            .flex(layout::Flex::Center)
-            .areas(area);
-        let [_, area, _] = Layout::vertical([Constraint::Ratio(1, 3)].repeat(3))
-            .flex(layout::Flex::Center)
-            .areas(area);
+        let area = area.centered(Constraint::Max(48), Constraint::Max(12));
 
         let [heading, separator, area] =
             Layout::vertical([Constraint::Max(1), Constraint::Max(1), Constraint::Fill(1)])
@@ -179,7 +178,7 @@ impl Component for Impolite {
         Line::from_iter([
             Span::raw("• Logging into "),
             Span::raw(state.hostname.as_ref())
-                .style(Style::new().fg(PALETTE[7][10]))
+                .style(Style::new().bg(PALETTE[6][10]).fg(Color::Black))
                 .bold(),
         ])
         .render(heading, frame.buffer_mut());
@@ -230,6 +229,15 @@ struct InputComponentState {
     text: Input,
 }
 
+impl<'a> InputComponent<'a> {
+    fn value<'s>(&'_ self, state: &'s InputComponentState) -> Cow<'s, str> {
+        match self.field {
+            Field::UsernameField => state.text.value().into(),
+            Field::PasswordField => "*".repeat(state.text.value().len()).into(),
+        }
+    }
+}
+
 impl<'a> Component for InputComponent<'a> {
     type State = InputComponentState;
 
@@ -245,7 +253,7 @@ impl<'a> Component for InputComponent<'a> {
 
     fn render(&self, area: Rect, frame: &mut Frame, state: &mut Self::State) {
         let [label_area, input_area] = Layout::horizontal([
-            Constraint::Max(self.field.label().len() as _),
+            Constraint::Max(self.field.label(None).len() as _),
             Constraint::Min(2),
         ])
         .spacing(2)
@@ -253,21 +261,27 @@ impl<'a> Component for InputComponent<'a> {
 
         state.position = (input_area.x, input_area.y);
 
-        let style = match &self.field == self.current_focus {
-            true => Style::new()
-                .bg(PALETTE[0][0])
-                .bold()
-                .fg(Color::from_u32(0x00ffffff)),
-            false => Style::new()
-                .dim()
-                .bg(PALETTE[5][2])
-                .fg(Color::from_u32(0x00ffffff)),
+        let is_focused = &self.field == self.current_focus;
+
+        let label_style = match is_focused {
+            true => Style::new().fg(PALETTE[0][0]),
+            // .fg(Color::from_u32(0x00ffffff)),
+            false => Style::new().fg(PALETTE[4][6]), // .bg(PALETTE[5][2])
         };
+
+        let text_style = match is_focused {
+            true => Style::new().fg(PALETTE[1][2]).bold(),
+            // .fg(Color::from_u32(0x00ffffff)),
+            false => Style::new(), // .bg(PALETTE[5][2])
+        };
+
         self.field
-            .label()
-            .set_style(style)
+            .label(Some(is_focused))
+            .set_style(label_style)
             .render(label_area, frame.buffer_mut());
-        state.text.value().render(input_area, frame.buffer_mut());
+        self.value(state)
+            .set_style(text_style)
+            .render(input_area, frame.buffer_mut());
     }
 }
 
@@ -299,4 +313,18 @@ impl Component for HelpArea {
         ]))
         .render(area, frame.buffer_mut());
     }
+}
+
+fn color_dim(color: Color, by: f32) -> Color {
+    if let Color::Rgb(r, g, b) = color {
+        let conv = |c: u8, o: u8| {
+            let c = c as f32;
+            let c = c * (1.0 - by);
+            let c = c as u8;
+            u32::from(c) << o
+        };
+        let value = conv(r, 16) + conv(g, 8) + conv(b, 0);
+        return Color::from_u32(value);
+    }
+    return color;
 }
