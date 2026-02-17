@@ -1,22 +1,25 @@
 use std::borrow::Cow;
+use std::io::BufWriter;
 use std::net::hostname;
+use std::os::unix::net::UnixStream;
 
-use ratatui::crossterm::event::{Event, KeyModifiers};
+use ratatui::crossterm::event::KeyModifiers;
 use ratatui::prelude::*;
 use ratatui::style::Styled;
 use ratatui::widgets::{Block, Padding, Paragraph};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
+use crate::greetd::{GreetdWrite, Request, Response};
 use crate::lipgloss_colors::PALETTE;
-use crate::{AppArgs, AppMsg, Str};
+use crate::{AppArgs, AppMsg, RenderMode, Str};
 
 pub trait Component {
     type State;
     type UpdateRet = ();
     type RenderRet = ();
 
-    fn update(&self, event: AppMsg, state: &mut Self::State) -> Self::UpdateRet;
+    fn update(&mut self, event: AppMsg, state: &mut Self::State) -> Self::UpdateRet;
 
     fn render(&self, area: Rect, frame: &mut Frame, state: &mut Self::State) -> Self::RenderRet;
 }
@@ -51,21 +54,17 @@ enum Field {
     PasswordField,
 }
 
-impl Field {
-    fn handle_event(self, event: &Event) -> Self {
-        match (&self, event) {
-            (
-                Self::UsernameField,
-                key!(Down) | key!(Char('j'), KeyModifiers::CONTROL) | key!(Tab) | key!(Enter),
-            ) => Field::PasswordField,
-            (
-                Self::PasswordField,
-                key!(Up) | key!(Char('k'), KeyModifiers::CONTROL) | key!(Tab),
-            ) => Field::UsernameField,
-            _ => self,
-        }
-    }
+#[derive(Debug)]
+enum FormState {
+    WaitingForSession,
+    WaitingForSessionSuccess,
+    WaitingForLoginSuccess,
+    Failed(Str),
+    PickingDesktop,
+    Done,
+}
 
+impl Field {
     fn label(&self, is_focused: Option<bool>) -> &'static str {
         let is_focused = is_focused.unwrap_or_default();
         match (self, is_focused) {
@@ -75,14 +74,22 @@ impl Field {
             (Field::PasswordField, true) => "| Password",
         }
     }
+
+    fn is(&self, other: Field) -> bool {
+        *self == other
+    }
 }
 
-pub struct Impolite(&'static AppArgs);
+pub struct Impolite<'a>(&'static AppArgs, Option<&'a mut BufWriter<UnixStream>>);
 pub struct ImpoliteState {
+    pub render_mode: RenderMode,
     pub exit_flag: bool,
     pub hostname: Str,
+    pub error: Option<color_eyre::Report>,
+    last_response: Option<Response>,
     focus: Field,
     prompts: PromptState,
+    form_state: FormState,
 }
 
 #[derive(Default)]
@@ -91,9 +98,12 @@ struct PromptState {
     password: InputComponentState,
 }
 
-impl Impolite {
-    pub const fn new(args: &'static AppArgs) -> Self {
-        Self(args)
+impl<'a> Impolite<'a> {
+    pub const fn new(
+        args: &'static AppArgs,
+        socket: Option<&'a mut BufWriter<UnixStream>>,
+    ) -> Self {
+        Self(args, socket)
     }
 }
 
@@ -104,10 +114,14 @@ impl ImpoliteState {
             .unwrap_or("machine".into());
         let host = format!(" {host} ");
         Self {
+            render_mode: RenderMode::Reactive,
             exit_flag: false,
             hostname: host.into(),
             focus: Field::default(),
             prompts: PromptState::default(),
+            form_state: FormState::WaitingForSession,
+            last_response: None,
+            error: None,
         }
     }
 
@@ -138,31 +152,133 @@ impl Default for ImpoliteState {
     }
 }
 
-impl Component for Impolite {
+impl<'a> Impolite<'a> {
+    fn greetd_write(&mut self, state: &mut ImpoliteState, req: Request) {
+        let res = self.1.greetd_write(req);
+        let err = res.err();
+        state.error = err;
+    }
+}
+
+impl<'a> Component for Impolite<'a> {
     type State = ImpoliteState;
 
-    fn update(&self, event: AppMsg, state: &mut Self::State) {
-        InputComponent {
-            field: Field::UsernameField,
-            current_focus: &state.focus,
+    fn update(&mut self, event: AppMsg, state: &mut Self::State) {
+        let input_event =
+            UsernameInput::new(&mut state.focus).update(event.clone(), &mut state.prompts.username);
+        let input_event = input_event
+            .or(PasswordInput::new(&mut state.focus)
+                .update(event.clone(), &mut state.prompts.password));
+        match input_event {
+            Some(FormInputEvent::Confirm) => {
+                let res = self.1.greetd_write(Request::CreateSession {
+                    username: state.prompts.username.text.value().into(),
+                });
+                let err = res.err();
+                state.form_state = FormState::WaitingForSessionSuccess;
+                state.error = err;
+            }
+            Some(FormInputEvent::FocusOn(field)) => {
+                state.focus = field;
+            }
+            None => {}
         }
-        .update(event.clone(), &mut state.prompts.username);
-        InputComponent {
-            field: Field::PasswordField,
-            current_focus: &state.focus,
-        }
-        .update(event.clone(), &mut state.prompts.password);
 
-        match &event {
+        match event {
             AppMsg::TermEvent(key!(Char('c' | 'C'), KeyModifiers::CONTROL)) => {
                 state.exit_flag = true;
             }
-
-            AppMsg::TermEvent(event) => {
-                state.focus = state.focus.handle_event(event);
+            AppMsg::GreetdEvent(res) => {
+                state.last_response = Some(res.clone());
+                match (&state.form_state, res) {
+                    (FormState::WaitingForSession, _) => {}
+                    (FormState::WaitingForSessionSuccess, Response::Success) => {
+                        state.form_state = FormState::WaitingForLoginSuccess;
+                        self.greetd_write(
+                            state,
+                            Request::PostAuthMessageResponse {
+                                response: Some(state.prompts.password.text.value().into()),
+                            },
+                        );
+                    }
+                    (
+                        FormState::WaitingForSessionSuccess,
+                        Response::Error {
+                            error_type,
+                            description,
+                        },
+                    ) => todo!(),
+                    (
+                        FormState::WaitingForSessionSuccess,
+                        Response::AuthMessage {
+                            auth_message_type,
+                            auth_message,
+                        },
+                    ) => todo!(),
+                    (FormState::Failed(_), Response::Success) => todo!(),
+                    (
+                        FormState::Failed(_),
+                        Response::Error {
+                            error_type,
+                            description,
+                        },
+                    ) => todo!(),
+                    (
+                        FormState::Failed(_),
+                        Response::AuthMessage {
+                            auth_message_type,
+                            auth_message,
+                        },
+                    ) => todo!(),
+                    (FormState::PickingDesktop, Response::Success) => todo!(),
+                    (
+                        FormState::PickingDesktop,
+                        Response::Error {
+                            error_type,
+                            description,
+                        },
+                    ) => todo!(),
+                    (
+                        FormState::PickingDesktop,
+                        Response::AuthMessage {
+                            auth_message_type,
+                            auth_message,
+                        },
+                    ) => todo!(),
+                    (FormState::Done, Response::Success) => todo!(),
+                    (
+                        FormState::Done,
+                        Response::Error {
+                            error_type,
+                            description,
+                        },
+                    ) => todo!(),
+                    (
+                        FormState::Done,
+                        Response::AuthMessage {
+                            auth_message_type,
+                            auth_message,
+                        },
+                    ) => todo!(),
+                    (FormState::WaitingForLoginSuccess, Response::Success) => {
+                        state.form_state = FormState::PickingDesktop;
+                    }
+                    (
+                        FormState::WaitingForLoginSuccess,
+                        Response::Error {
+                            error_type,
+                            description,
+                        },
+                    ) => todo!(),
+                    (
+                        FormState::WaitingForLoginSuccess,
+                        Response::AuthMessage {
+                            auth_message_type,
+                            auth_message,
+                        },
+                    ) => todo!(),
+                }
             }
-
-            AppMsg::GreetdEvent(_) => {}
             _ => {}
         };
     }
@@ -178,7 +294,7 @@ impl Component for Impolite {
         Line::from_iter([
             Span::raw("• Logging into "),
             Span::raw(state.hostname.as_ref())
-                .style(Style::new().bg(PALETTE[6][10]).fg(Color::Black))
+                .style(Style::new().bg(PALETTE[6][10]).fg(Color::from_u32(0)))
                 .bold(),
         ])
         .render(heading, frame.buffer_mut());
@@ -188,39 +304,38 @@ impl Component for Impolite {
             .set_style(Style::new().fg(Color::from_u32(0x004e4e4e)))
             .render(separator, frame.buffer_mut());
 
-        let [user_area, pass_area, rest] = Layout::vertical([
+        let [user_area, pass_area, pick_desktop_area, rest] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Fill(1),
+            Constraint::Max(4),
         ])
         .spacing(1)
         .areas(area);
 
-        InputComponent {
-            current_focus: &state.focus,
-            field: Field::UsernameField,
-        }
-        .render(user_area, frame, &mut state.prompts.username);
+        UsernameInput::new(&mut state.focus).render(user_area, frame, &mut state.prompts.username);
+        PasswordInput::new(&mut state.focus).render(pass_area, frame, &mut state.prompts.password);
 
-        InputComponent {
-            current_focus: &state.focus,
-            field: Field::PasswordField,
+        if matches!(state.form_state, FormState::PickingDesktop) {
+            DesktopPicker.render(pick_desktop_area, frame, &mut DesktopPickerState);
         }
-        .render(pass_area, frame, &mut state.prompts.password);
 
-        let [help_area] = Layout::vertical([Constraint::Max(3)])
+        let [help_area, debug_area] = Layout::vertical([Constraint::Max(3), Constraint::Min(1)])
             .flex(layout::Flex::End)
             .areas(rest);
 
         HelpArea.render(help_area, frame, &mut ());
 
+        format!("{:?} - {:?}", state.last_response, state.form_state)
+            .render(debug_area, frame.buffer_mut());
+
         frame.set_cursor_position(state.current_prompt_cursor());
     }
 }
 
-struct InputComponent<'a> {
+struct InputComponent {
     field: Field,
-    current_focus: &'a Field,
+    current_focus: Field,
 }
 
 #[derive(Default, Clone)]
@@ -229,7 +344,7 @@ struct InputComponentState {
     text: Input,
 }
 
-impl<'a> InputComponent<'a> {
+impl InputComponent {
     fn value<'s>(&'_ self, state: &'s InputComponentState) -> Cow<'s, str> {
         match self.field {
             Field::UsernameField => state.text.value().into(),
@@ -238,15 +353,15 @@ impl<'a> InputComponent<'a> {
     }
 }
 
-impl<'a> Component for InputComponent<'a> {
+impl Component for InputComponent {
     type State = InputComponentState;
 
-    fn update(&self, event: AppMsg, state: &mut Self::State) {
+    fn update(&mut self, event: AppMsg, state: &mut Self::State) {
         let AppMsg::TermEvent(event) = event else {
             return;
         };
 
-        if self.current_focus == &self.field {
+        if self.current_focus == self.field {
             state.text.handle_event(&event);
         }
     }
@@ -261,7 +376,7 @@ impl<'a> Component for InputComponent<'a> {
 
         state.position = (input_area.x, input_area.y);
 
-        let is_focused = &self.field == self.current_focus;
+        let is_focused = self.field == self.current_focus;
 
         let label_style = match is_focused {
             true => Style::new().fg(PALETTE[0][0]),
@@ -290,7 +405,7 @@ struct HelpArea;
 impl Component for HelpArea {
     type State = ();
 
-    fn update(&self, _: AppMsg, _: &mut Self::State) {}
+    fn update(&mut self, _: AppMsg, _: &mut Self::State) {}
 
     fn render(&self, area: Rect, frame: &mut Frame, _: &mut Self::State) {
         let bind = |text: &'static str| text.fg(Color::from_u32(0x00626262));
@@ -326,5 +441,109 @@ fn color_dim(color: Color, by: f32) -> Color {
         let value = conv(r, 16) + conv(g, 8) + conv(b, 0);
         return Color::from_u32(value);
     }
-    return color;
+    color
+}
+
+struct UsernameInput<'a> {
+    input: InputComponent,
+    focus: &'a mut Field,
+}
+
+impl<'a> UsernameInput<'a> {
+    fn new(current_focus: &'a mut Field) -> Self {
+        Self {
+            input: InputComponent {
+                field: Field::UsernameField,
+                current_focus: *current_focus,
+            },
+            focus: current_focus,
+        }
+    }
+}
+
+struct PasswordInput<'a> {
+    input: InputComponent,
+    focus: &'a mut Field,
+}
+
+enum FormInputEvent {
+    Confirm,
+    FocusOn(Field),
+}
+
+impl<'a> PasswordInput<'a> {
+    fn new(current_focus: &'a mut Field) -> Self {
+        Self {
+            input: InputComponent {
+                field: Field::PasswordField,
+                current_focus: *current_focus,
+            },
+            focus: current_focus,
+        }
+    }
+}
+
+impl<'a> Component for UsernameInput<'a> {
+    type State = InputComponentState;
+    type UpdateRet = Option<FormInputEvent>;
+
+    fn update(&mut self, event: AppMsg, state: &mut Self::State) -> Self::UpdateRet {
+        if !self.focus.is(Field::UsernameField) {
+            return None;
+        }
+
+        if let AppMsg::TermEvent(
+            key!(Enter) | key!(Tab) | key!(Char('j'), KeyModifiers::CONTROL) | key!(Down),
+        ) = event
+        {
+            return Some(FormInputEvent::FocusOn(Field::PasswordField));
+        };
+
+        self.input.update(event, state);
+        None
+    }
+
+    fn render(&self, area: Rect, frame: &mut Frame, state: &mut Self::State) -> Self::RenderRet {
+        self.input.render(area, frame, state);
+    }
+}
+
+impl<'a> Component for PasswordInput<'a> {
+    type State = InputComponentState;
+    type UpdateRet = Option<FormInputEvent>;
+
+    fn update(&mut self, event: AppMsg, state: &mut Self::State) -> Self::UpdateRet {
+        if !self.focus.is(Field::PasswordField) {
+            return None;
+        }
+
+        if let AppMsg::TermEvent(key!(Tab) | key!(Up) | key!(Char('k'), KeyModifiers::CONTROL)) =
+            event
+        {
+            return Some(FormInputEvent::FocusOn(Field::UsernameField));
+        };
+
+        if let AppMsg::TermEvent(key!(Enter)) = event {
+            return Some(FormInputEvent::Confirm);
+        };
+
+        self.input.update(event, state);
+
+        None
+    }
+
+    fn render(&self, area: Rect, frame: &mut Frame, state: &mut Self::State) -> Self::RenderRet {
+        self.input.render(area, frame, state);
+    }
+}
+
+struct DesktopPicker;
+struct DesktopPickerState;
+
+impl Component for DesktopPicker {
+    type State = DesktopPickerState;
+
+    fn update(&mut self, event: AppMsg, state: &mut Self::State) -> Self::UpdateRet {}
+
+    fn render(&self, area: Rect, frame: &mut Frame, state: &mut Self::State) -> Self::RenderRet {}
 }

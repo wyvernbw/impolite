@@ -8,9 +8,13 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 use color_eyre::eyre::eyre;
 use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::IsTerminal;
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
+use std::time::Duration;
 use tracing::instrument;
 
 use tracing_error::ErrorLayer;
@@ -29,6 +33,7 @@ pub mod lipgloss_colors;
 pub type Str = Arc<str>;
 
 fn main() -> Result<()> {
+    dbg!(std::io::stdout().is_terminal());
     let subscriber = tracing_subscriber::Registry::default()
         // any number of other subscriber layers may be added before or
         // after the `ErrorLayer`...
@@ -64,11 +69,20 @@ pub enum AppMsg {
 
 fn app() -> Result<()> {
     let args = AppArgs::try_new().wrap_err("failed to parse cli arguments")?;
-    let args = Box::leak(Box::new(args));
+    let args: &'static AppArgs = Box::leak(Box::new(args));
 
     let (event_tx, event_rx) = mpsc::channel::<AppMsg>();
-    let event_thread = std::thread::spawn(|| event_loop(args, event_tx));
-    let render_thread = std::thread::spawn(|| render_loop(args, event_rx));
+    let socket = try_connect(args)?;
+    let socket_2 = match socket {
+        Some(ref socket) => Some(BufWriter::new(
+            socket
+                .try_clone()
+                .wrap_err("failed to clone greetd connection")?,
+        )),
+        None => None,
+    };
+    let event_thread = std::thread::spawn(move || event_loop(args, event_tx, socket));
+    let render_thread = std::thread::spawn(move || render_loop(args, event_rx, socket_2));
 
     render_thread
         .join()
@@ -83,8 +97,7 @@ fn app() -> Result<()> {
     Ok(())
 }
 
-#[instrument(ret, err, skip(event_tx))]
-fn event_loop(args: &'static AppArgs, event_tx: Sender<AppMsg>) -> Result<()> {
+fn try_connect(args: &AppArgs) -> Result<Option<UnixStream>> {
     let socket = greetd::greetd_connect();
 
     let socket = match (socket, args.debug) {
@@ -92,7 +105,15 @@ fn event_loop(args: &'static AppArgs, event_tx: Sender<AppMsg>) -> Result<()> {
         (Err(_), true) => None,
         (Err(report), false) => return Err(report),
     };
+    Ok(socket)
+}
 
+#[instrument(ret, err, skip(event_tx))]
+fn event_loop(
+    args: &'static AppArgs,
+    event_tx: Sender<AppMsg>,
+    socket: Option<UnixStream>,
+) -> Result<()> {
     std::thread::scope(|scope| {
         scope.spawn(|| {
             while let Ok(event) = ratatui::crossterm::event::read() {
@@ -116,26 +137,56 @@ fn event_loop(args: &'static AppArgs, event_tx: Sender<AppMsg>) -> Result<()> {
     Ok(())
 }
 
-#[instrument(ret, err)]
-fn render_loop(args: &'static AppArgs, event_rx: Receiver<AppMsg>) -> color_eyre::Result<()> {
+pub enum RenderMode {
+    Reactive,
+    Loop,
+}
+
+#[instrument(skip(event_rx, socket), err)]
+fn render_loop(
+    args: &'static AppArgs,
+    event_rx: Receiver<AppMsg>,
+    mut socket: Option<BufWriter<UnixStream>>,
+) -> color_eyre::Result<()> {
     let mut term = ratatui::init();
 
-    let app = Impolite::new(args);
+    let mut app = Impolite::new(args, socket.as_mut());
     let mut app_state = ImpoliteState::new();
 
     term.draw(|frame| {
         app.render(frame.area(), frame, &mut app_state);
     })?;
 
-    while let Ok(msg) = event_rx.recv() {
-        app.update(msg, &mut app_state);
-        if app_state.exit_flag {
-            break;
+    loop {
+        match app_state.render_mode {
+            RenderMode::Reactive => {
+                let Ok(msg) = event_rx.recv() else {
+                    break;
+                };
+                app.update(msg, &mut app_state);
+
+                if app_state.exit_flag {
+                    break;
+                }
+                term.draw(|frame| {
+                    app.render(frame.area(), frame, &mut app_state);
+                })?;
+            }
+            RenderMode::Loop => {
+                if let Ok(msg) = event_rx.try_recv() {
+                    app.update(msg, &mut app_state);
+                    if app_state.exit_flag {
+                        break;
+                    }
+                    term.draw(|frame| {
+                        app.render(frame.area(), frame, &mut app_state);
+                    })?;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
-        term.draw(|frame| {
-            app.render(frame.area(), frame, &mut app_state);
-        })?;
     }
+
     ratatui::restore();
     Ok(())
 }

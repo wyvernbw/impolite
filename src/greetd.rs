@@ -1,4 +1,9 @@
-use std::{io::Read, os::unix::net::UnixStream, path::PathBuf, sync::Arc};
+use std::{
+    io::{BufWriter, Read, Write},
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use color_eyre::{Result, Section, eyre::Context};
 use freedesktop_desktop_entry::{DesktopEntry, desktop_entries, get_languages_from_env};
@@ -19,7 +24,9 @@ pub enum Request {
     CreateSession {
         username: Str,
     },
-    PostAuthMessageResponse,
+    PostAuthMessageResponse {
+        response: Option<Str>,
+    },
     StartSession {
         command: Arc<[Str]>,
         env: Arc<[Str]>,
@@ -55,36 +62,73 @@ pub enum ErrorType {
     Error,
 }
 
-#[instrument]
+#[instrument(err)]
 pub fn greetd_socket_addr() -> Result<PathBuf> {
-    let addr = std::env::var("GREETD_SOCK")
+    let path = std::env::var("GREETD_SOCK")
         .wrap_err("failed to read GREETD_SOCK from env")
         .suggestion(
             "Greetd must be running for Impolite to work. You might already be logged in.",
         )?;
-    let addr = addr.parse()?;
-    Ok(addr)
+    let path = path.parse()?;
+    Ok(path)
 }
 
+#[instrument(err)]
 pub fn greetd_connect() -> Result<UnixStream> {
     let addr = greetd_socket_addr()?;
     let conn = UnixStream::connect(addr)?;
+    tracing::info!("CONNECTED ON {conn:?}");
     Ok(conn)
 }
 
+#[instrument(skip_all, err)]
 pub fn greetd_decode(transport: &mut impl Read) -> Result<Response> {
     let mut len_buf = [0u8; 4];
     transport.read_exact(&mut len_buf)?;
     let len = u32::from_ne_bytes(len_buf);
+    tracing::info!("RECV {len} bytes");
     let mut buf = vec![0u8; len as _];
     transport.read_exact(&mut buf)?;
     greetd_decode_impl(&buf)
 }
 
+#[instrument(err)]
 fn greetd_decode_impl(bytes: &[u8]) -> Result<Response> {
     let string = std::str::from_utf8(bytes)?;
+    tracing::info!("GOT {string}");
     let res = serde_json::from_str(string)?;
     Ok(res)
+}
+
+pub(crate) trait GreetdWrite {
+    fn greetd_write(&mut self, msg: Request) -> Result<()>;
+}
+
+impl GreetdWrite for BufWriter<UnixStream> {
+    #[instrument(skip_all, err)]
+    fn greetd_write(&mut self, msg: Request) -> Result<()> {
+        let msg = serde_json::to_string(&msg).wrap_err("failed to serialize msg")?;
+        {
+            let msg = msg.as_bytes();
+            let len = msg.len();
+            self.write_all(&u32::to_ne_bytes(len as u32))
+                .wrap_err("failed to write length prefix over greetd socket")?;
+            self.write_all(msg)
+                .wrap_err("failed to write over greetd socket")?;
+        }
+        self.flush().wrap_err("failed to flush greetd socket")?;
+        tracing::info!("WROTE {msg}");
+        Ok(())
+    }
+}
+
+impl GreetdWrite for Option<&mut BufWriter<UnixStream>> {
+    fn greetd_write(&mut self, msg: Request) -> Result<()> {
+        match self {
+            Some(socket) => socket.greetd_write(msg),
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -92,7 +136,7 @@ mod tests {
     use crate::greetd::{Request, Response};
 
     #[test]
-    fn serialize_messages() -> color_eyre::Result<()> {
+    fn serialize_create_session() -> color_eyre::Result<()> {
         let msg = Request::CreateSession {
             username: "Bingus".into(),
         };
@@ -102,9 +146,28 @@ mod tests {
             r#"{"type":"create_session","username":"Bingus"}"#
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_success() -> color_eyre::Result<()> {
         let msg = Response::Success;
 
         assert_eq!(serde_json::to_string(&msg)?, r#"{"type":"success"}"#);
+
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_post_auth_message_response() -> color_eyre::Result<()> {
+        let msg = Request::PostAuthMessageResponse {
+            response: Some("1234".into()),
+        };
+
+        assert_eq!(
+            serde_json::to_string(&msg)?,
+            r#"{"type":"post_auth_message_response","response":"1234"}"#
+        );
 
         Ok(())
     }
