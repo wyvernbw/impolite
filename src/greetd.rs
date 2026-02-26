@@ -1,13 +1,16 @@
-use std::{
-    io::{BufWriter, Read, Write},
-    os::unix::net::UnixStream,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use color_eyre::{Result, Section, eyre::Context};
 use freedesktop_desktop_entry::{DesktopEntry, desktop_entries, get_languages_from_env};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::io::BufWriter;
+use tokio::net::UnixStream;
+
 use tracing::instrument;
 
 use crate::Str;
@@ -74,21 +77,21 @@ pub fn greetd_socket_addr() -> Result<PathBuf> {
 }
 
 #[instrument(err)]
-pub fn greetd_connect() -> Result<UnixStream> {
+pub async fn greetd_connect() -> Result<UnixStream> {
     let addr = greetd_socket_addr()?;
-    let conn = UnixStream::connect(addr)?;
+    let conn = UnixStream::connect(addr).await?;
     tracing::info!("CONNECTED ON {conn:?}");
     Ok(conn)
 }
 
 #[instrument(skip_all, err)]
-pub fn greetd_decode(transport: &mut impl Read) -> Result<Response> {
+pub async fn greetd_decode<A: AsyncRead + Unpin>(transport: &mut A) -> Result<Response> {
     let mut len_buf = [0u8; 4];
-    transport.read_exact(&mut len_buf)?;
+    transport.read_exact(&mut len_buf).await?;
     let len = u32::from_ne_bytes(len_buf);
     tracing::info!("RECV {len} bytes");
     let mut buf = vec![0u8; len as _];
-    transport.read_exact(&mut buf)?;
+    transport.read_exact(&mut buf).await?;
     greetd_decode_impl(&buf)
 }
 
@@ -101,33 +104,31 @@ fn greetd_decode_impl(bytes: &[u8]) -> Result<Response> {
 }
 
 pub(crate) trait GreetdWrite {
-    fn greetd_write(&mut self, msg: Request) -> Result<()>;
+    async fn greetd_write(&mut self, msg: Request) -> Result<()>;
 }
 
-impl GreetdWrite for BufWriter<UnixStream> {
+impl<W> GreetdWrite for W
+where
+    W: AsyncWrite + Unpin,
+{
     #[instrument(skip_all, err)]
-    fn greetd_write(&mut self, msg: Request) -> Result<()> {
+    async fn greetd_write(&mut self, msg: Request) -> Result<()> {
         let msg = serde_json::to_string(&msg).wrap_err("failed to serialize msg")?;
         {
             let msg = msg.as_bytes();
             let len = msg.len();
             self.write_all(&u32::to_ne_bytes(len as u32))
+                .await
                 .wrap_err("failed to write length prefix over greetd socket")?;
             self.write_all(msg)
+                .await
                 .wrap_err("failed to write over greetd socket")?;
         }
-        self.flush().wrap_err("failed to flush greetd socket")?;
+        self.flush()
+            .await
+            .wrap_err("failed to flush greetd socket")?;
         tracing::info!("WROTE {msg}");
         Ok(())
-    }
-}
-
-impl GreetdWrite for Option<&mut BufWriter<UnixStream>> {
-    fn greetd_write(&mut self, msg: Request) -> Result<()> {
-        match self {
-            Some(socket) => socket.greetd_write(msg),
-            None => Ok(()),
-        }
     }
 }
 

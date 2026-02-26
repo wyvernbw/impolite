@@ -12,7 +12,6 @@ use tui_input::backend::crossterm::EventHandler;
 
 use crate::greetd::{GreetdWrite, Request, Response};
 use crate::lipgloss_colors::PALETTE;
-use crate::{AppArgs, AppMsg, RenderMode, Str};
 
 pub trait Component {
     type State;

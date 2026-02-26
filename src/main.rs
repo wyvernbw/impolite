@@ -6,34 +6,39 @@
 
 use color_eyre::Result;
 use color_eyre::eyre::Context;
-use color_eyre::eyre::eyre;
-use std::io::BufReader;
-use std::io::BufWriter;
-use std::io::IsTerminal;
-use std::os::unix::net::UnixStream;
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, mpsc};
-use std::time::Duration;
-use tracing::instrument;
+use flume::Receiver;
+use flume::Sender;
+use mana_tui::mana_tui_potion::Effect;
+use mana_tui::mana_tui_potion::Message;
+use mana_tui::mana_tui_potion::focus::handlers::On;
+use mana_tui::mana_tui_utils::key;
+use ratatui::crossterm::event::KeyModifiers;
+use std::sync::Arc;
+use tokio::io::BufReader;
+use tokio::io::BufWriter;
+use tokio::select;
 
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
 use ratatui::crossterm::event;
 
-use crate::impolite::{Component, Impolite, ImpoliteState};
+use mana_tui::mana_tui_potion;
+use mana_tui::prelude::*;
+
+use crate::greetd::GreetdWrite;
+use crate::greetd::greetd_connect;
+use crate::greetd::greetd_decode;
 
 pub mod greetd;
-#[path = "impolite/impolite.rs"]
-pub mod impolite;
 #[path = "lipgloss-colors.rs"]
 pub mod lipgloss_colors;
 
 pub type Str = Arc<str>;
 
-fn main() -> Result<()> {
-    dbg!(std::io::stdout().is_terminal());
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    color_eyre::install()?;
     let subscriber = tracing_subscriber::Registry::default()
         // any number of other subscriber layers may be added before or
         // after the `ErrorLayer`...
@@ -42,151 +47,90 @@ fn main() -> Result<()> {
     // set the subscriber as the default for the application
     tracing::subscriber::set_global_default(subscriber)?;
 
-    color_eyre::install()?;
+    mana_tui_potion::run()
+        .init(init)
+        .view(view)
+        .quit_signal(|_, msg| matches!(msg, Msg::Quit))
+        .update(update)
+        .run()
+        .await?;
 
-    app()
-}
-
-#[derive(Debug)]
-pub struct AppArgs {
-    debug: bool,
-}
-
-impl AppArgs {
-    fn try_new() -> Result<Self> {
-        let mut pargs = pico_args::Arguments::from_env();
-        Ok(Self {
-            debug: pargs.contains(["-d", "--debug"]),
-        })
-    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
-pub enum AppMsg {
-    TermEvent(event::Event),
-    GreetdEvent(greetd::Response),
+enum Msg {
+    Quit,
+    Error(Arc<color_eyre::Report>),
+    GreetdRes(greetd::Response),
 }
 
-fn app() -> Result<()> {
-    let args = AppArgs::try_new().wrap_err("failed to parse cli arguments")?;
-    let args: &'static AppArgs = Box::leak(Box::new(args));
-
-    let (event_tx, event_rx) = mpsc::channel::<AppMsg>();
-    let socket = try_connect(args)?;
-    let socket_2 = match socket {
-        Some(ref socket) => Some(BufWriter::new(
-            socket
-                .try_clone()
-                .wrap_err("failed to clone greetd connection")?,
-        )),
-        None => None,
-    };
-    let event_thread = std::thread::spawn(move || event_loop(args, event_tx, socket));
-    let render_thread = std::thread::spawn(move || render_loop(args, event_rx, socket_2));
-
-    render_thread
-        .join()
-        .map_err(|_| eyre!("thread join error"))??;
-
-    if event_thread.is_finished() {
-        event_thread
-            .join()
-            .map_err(|_| eyre!("thread join error"))??;
-    }
-
-    Ok(())
+impl Message for Msg {
+    type Model = Model;
 }
 
-fn try_connect(args: &AppArgs) -> Result<Option<UnixStream>> {
-    let socket = greetd::greetd_connect();
-
-    let socket = match (socket, args.debug) {
-        (Ok(socket), _) => Some(socket),
-        (Err(_), true) => None,
-        (Err(report), false) => return Err(report),
-    };
-    Ok(socket)
+struct Model {
+    req_tx: Sender<greetd::Request>,
 }
 
-#[instrument(ret, err, skip(event_tx))]
-fn event_loop(
-    args: &'static AppArgs,
-    event_tx: Sender<AppMsg>,
-    socket: Option<UnixStream>,
-) -> Result<()> {
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            while let Ok(event) = ratatui::crossterm::event::read() {
-                if event_tx.send(AppMsg::TermEvent(event)).is_err() {
-                    break;
+async fn init() -> (Model, Effect<Msg>) {
+    let (req_tx, req_rx) = flume::unbounded();
+    (
+        Model {
+            req_tx: req_tx.clone(),
+        },
+        Effect::new(move |tx| {
+            let req_rx = req_rx.clone();
+            async move {
+                if let Err(err) = greetd_task(req_rx).await {
+                    tx.send(Msg::Error(Arc::new(err)))
+                        .wrap_err("Fatal channel error")
+                        .unwrap();
                 }
             }
-        });
-
-        if let Some(socket) = socket {
-            scope.spawn(|| {
-                let mut transport = BufReader::new(socket);
-                while let Ok(res) = greetd::greetd_decode(&mut transport) {
-                    if event_tx.send(AppMsg::GreetdEvent(res)).is_err() {
-                        break;
-                    }
-                }
-            });
-        };
-    });
-    Ok(())
+        }),
+    )
 }
 
-pub enum RenderMode {
-    Reactive,
-    Loop,
-}
-
-#[instrument(skip(event_rx, socket), err)]
-fn render_loop(
-    args: &'static AppArgs,
-    event_rx: Receiver<AppMsg>,
-    mut socket: Option<BufWriter<UnixStream>>,
-) -> color_eyre::Result<()> {
-    let mut term = ratatui::init();
-
-    let mut app = Impolite::new(args, socket.as_mut());
-    let mut app_state = ImpoliteState::new();
-
-    term.draw(|frame| {
-        app.render(frame.area(), frame, &mut app_state);
-    })?;
+async fn greetd_task(req_rx: Receiver<greetd::Request>) -> Result<()> {
+    let mut greetd = greetd_connect().await?;
+    let (read, write) = greetd.into_split();
+    let mut greetd_read = BufReader::new(read);
+    let mut greetd_write = BufWriter::new(write);
 
     loop {
-        match app_state.render_mode {
-            RenderMode::Reactive => {
-                let Ok(msg) = event_rx.recv() else {
-                    break;
-                };
-                app.update(msg, &mut app_state);
-
-                if app_state.exit_flag {
-                    break;
-                }
-                term.draw(|frame| {
-                    app.render(frame.area(), frame, &mut app_state);
-                })?;
+        select! {
+            Ok(req) = req_rx.recv_async() => {
+                greetd_write
+                    .greetd_write(req).await
+                    .wrap_err("error writing request to greetd socket")?;
             }
-            RenderMode::Loop => {
-                if let Ok(msg) = event_rx.try_recv() {
-                    app.update(msg, &mut app_state);
-                    if app_state.exit_flag {
-                        break;
-                    }
-                    term.draw(|frame| {
-                        app.render(frame.area(), frame, &mut app_state);
-                    })?;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            Ok(res) = greetd_decode(&mut greetd_read) => {}
         }
     }
-
-    ratatui::restore();
     Ok(())
+}
+
+async fn view(model: &Model) -> View {
+    ui! {
+        <Block
+            On::new(|_, event| {
+                match event {
+                    key!(Char('c'), KeyModifiers::CONTROL) => Some((Msg::Quit, Effect::none())),
+                    _ => None
+                }
+            })
+        >
+        </Block>
+    }
+}
+
+async fn update(model: Model, msg: Msg) -> (Model, Effect<Msg>) {
+    match msg {
+        Msg::Quit => unreachable!(),
+        Msg::Error(report) => {
+            panic!("{report:?}")
+        }
+        Msg::GreetdRes(response) => (model, Effect::none()),
+    }
 }
