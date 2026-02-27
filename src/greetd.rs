@@ -15,7 +15,7 @@ use tracing::instrument;
 
 use crate::Str;
 
-pub fn get_sessions() -> Vec<DesktopEntry> {
+pub fn get_desktops() -> Vec<DesktopEntry> {
     let locales = get_languages_from_env();
 
     desktop_entries(&locales)

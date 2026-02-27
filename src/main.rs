@@ -9,6 +9,7 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 use flume::Receiver;
 use flume::Sender;
+use freedesktop_desktop_entry::DesktopEntry;
 use mana_tui::mana_tui_potion::Effect;
 use mana_tui::mana_tui_potion::Message;
 use mana_tui::mana_tui_potion::focus::handlers::On;
@@ -19,12 +20,11 @@ use std::borrow::Cow;
 use std::net::hostname;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
 use tokio::io::BufReader;
 use tokio::io::BufWriter;
 use tokio::net::unix;
-use tokio::pin;
 use tokio::select;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
@@ -37,6 +37,7 @@ use ratatui::crossterm::event;
 use mana_tui::mana_tui_potion;
 use mana_tui::prelude::*;
 
+use crate::greetd::ErrorType;
 use crate::greetd::GreetdWrite;
 use crate::greetd::greetd_connect;
 use crate::greetd::greetd_decode;
@@ -84,6 +85,10 @@ enum Msg {
     GreetdRes(greetd::Response),
     FieldUpdate(Field, Input),
     FocusOn(Focus),
+    SubmitLogin,
+
+    Nothing,
+    StartShell,
 }
 
 #[derive(Debug, Clone)]
@@ -102,12 +107,77 @@ struct Model {
     req_tx: Sender<greetd::Request>,
     fields: [tui_input::Input; 2],
     focus: Focus,
+    form_state: FormState,
+    last_response: Option<greetd::Response>,
+    desktops: Vec<DesktopEntry>,
+    dekstop_picker_state: Arc<Mutex<ListState>>,
+}
+
+impl Model {
+    fn field(&self, field: Field) -> &tui_input::Input {
+        &self.fields[field as usize]
+    }
+}
+
+#[derive(Debug, Clone)]
+enum FormState {
+    Idle,
+    CreatedSession,
+    LoginFailed(ErrorType, Str),
+    PickingDesktop,
+}
+
+enum FormEffect {
+    None,
+    SendPassword,
+    FocusDesktopPicker,
+}
+
+impl FormState {
+    fn update(self, res: greetd::Response) -> (Self, FormEffect) {
+        match (self, res) {
+            (FormState::Idle, _) => (FormState::Idle, FormEffect::None),
+            (FormState::CreatedSession, greetd::Response::Success) => {
+                (FormState::PickingDesktop, FormEffect::FocusDesktopPicker)
+            }
+            (
+                FormState::CreatedSession,
+                greetd::Response::Error {
+                    error_type,
+                    description,
+                },
+            ) => (Self::LoginFailed(error_type, description), FormEffect::None),
+            (
+                FormState::CreatedSession,
+                greetd::Response::AuthMessage {
+                    auth_message_type: greetd::AuthMessageType::Secret,
+                    auth_message: _,
+                },
+            ) => (Self::CreatedSession, FormEffect::SendPassword),
+            (FormState::CreatedSession, greetd::Response::AuthMessage { .. }) => {
+                (Self::CreatedSession, FormEffect::None)
+            }
+            (FormState::LoginFailed(_, _), greetd::Response::Success) => {
+                (FormState::PickingDesktop, FormEffect::None)
+            }
+            (FormState::LoginFailed(_, _), _) => todo!(),
+            (
+                _,
+                greetd::Response::Error {
+                    error_type,
+                    description,
+                },
+            ) => (Self::LoginFailed(error_type, description), FormEffect::None),
+            (FormState::PickingDesktop, _) => (FormState::PickingDesktop, FormEffect::None),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 enum Focus {
     UsernameField,
     PasswordField,
+    DesktopPicker,
 }
 
 impl Focus {
@@ -136,11 +206,15 @@ async fn init(cli_args: &'static CliArgs) -> (Model, Effect<Msg>) {
             cli_args,
             focus: Focus::UsernameField,
             fields: Default::default(),
+            form_state: FormState::Idle,
+            last_response: None,
+            desktops: greetd::get_desktops(),
+            dekstop_picker_state: Arc::new(Mutex::new(ListState::default())),
         },
         Effect::new(move |tx| {
             let req_rx = req_rx.clone();
             async move {
-                if let Err(err) = greetd_task(cli_args, req_rx).await {
+                if let Err(err) = greetd_task(cli_args, req_rx, tx.clone()).await {
                     tx.send(Msg::Error(Arc::new(err)))
                         .wrap_err("Fatal channel error")
                         .unwrap();
@@ -150,7 +224,11 @@ async fn init(cli_args: &'static CliArgs) -> (Model, Effect<Msg>) {
     )
 }
 
-async fn greetd_task(cli_args: &'static CliArgs, req_rx: Receiver<greetd::Request>) -> Result<()> {
+async fn greetd_task(
+    cli_args: &'static CliArgs,
+    req_rx: Receiver<greetd::Request>,
+    tx: Sender<Msg>,
+) -> Result<()> {
     let mut greetd = greetd_connect().await;
     let mut greetd = match (greetd, cli_args.debug) {
         (Ok(greetd), _) => Some(greetd),
@@ -197,10 +275,11 @@ async fn greetd_task(cli_args: &'static CliArgs, req_rx: Receiver<greetd::Reques
                         .wrap_err("error writing request to greetd socket")?;
                 }
             }
-            Ok(res) = greetd_decode(&mut stream) => {}
+            Ok(res) = greetd_decode(&mut stream) => {
+                tx.send_async(Msg::GreetdRes(res)).await?;
+            }
         }
     }
-    Ok(())
 }
 
 async fn view(model: &Model) -> View {
@@ -209,6 +288,9 @@ async fn view(model: &Model) -> View {
         .as_ref()
         .map(|str| str.to_string_lossy())
         .unwrap_or_else(|_| Cow::Borrowed("machine"));
+    let last_response = &model.last_response;
+    let form_state = &model.form_state;
+
     ui! {
         <Block
             On::new(|_, event| {
@@ -255,6 +337,7 @@ async fn view(model: &Model) -> View {
                             return None;
                         }
                         match event {
+                            key!(Enter) => Some((Msg::SubmitLogin, Effect::none())),
                             key!(Tab)
                             | key!(Char('k' | 'K'), KeyModifiers::CONTROL)
                             | key!(Up) => Some((Msg::FocusOn(Focus::UsernameField), Effect::none())),
@@ -262,6 +345,13 @@ async fn view(model: &Model) -> View {
                         }
                     })
                 />
+                <Maybe
+                    .cond={matches!(model.form_state, FormState::PickingDesktop)}
+                    .then={ui!{
+                      <DesktopPicker .model={model}/>
+                    }}
+                />
+                <Span>"{last_response:?}:{form_state:?}"</Span>
                 <HelpSection Padding::new(0, 0, 4, 0)/>
             </Block>
         </Block>
@@ -317,6 +407,45 @@ fn field_input(
 }
 
 #[subview]
+fn maybe(cond: bool, then: View, r#else: Option<View>) -> View {
+    if cond {
+        then
+    } else {
+        r#else.unwrap_or(ui! { "" })
+    }
+}
+
+#[subview]
+fn desktop_picker(model: &Model) -> View {
+    let items = model
+        .desktops
+        .iter()
+        .map(|desktop| desktop.path.to_string_lossy().to_string());
+    let list_state = model.dekstop_picker_state.clone();
+    ui! {
+        <Block>
+            "Pick a session"
+            <List
+                .items={items}
+                {model.dekstop_picker_state.clone()}
+                On::new(move |_, event| match event {
+                    key!(Char('j')) | key!(Tab) | key!(Down) => {
+                        list_state.lock().unwrap().select_next();
+                        None
+                    },
+                    key!(Char('k')) | key!(Up) => {
+                        list_state.lock().unwrap().select_previous();
+                        None
+                    },
+                    key!(Char('b')) => Some((Msg::StartShell, Effect::none())),
+                    _ => None
+                })
+            />
+        </Block>
+    }
+}
+
+#[subview]
 fn help_section() -> View {
     let bright = Color::from_u32(0x626262);
     let dark = Color::from_u32(0x4e4e4e);
@@ -336,11 +465,65 @@ async fn update(mut model: Model, msg: Msg) -> (Model, Effect<Msg>) {
         Msg::Error(report) => {
             panic!("{report:?}")
         }
-        Msg::GreetdRes(_res) => (model, Effect::none()),
+        Msg::GreetdRes(res) => {
+            let (form_state, form_effect) = model.form_state.clone().update(res.clone());
+            match form_effect {
+                FormEffect::None => {}
+                FormEffect::SendPassword => {
+                    model
+                        .req_tx
+                        .send_async(greetd::Request::PostAuthMessageResponse {
+                            response: Some(model.field(Field::Password).value().into()),
+                        })
+                        .await
+                        .unwrap();
+                }
+                FormEffect::FocusDesktopPicker => model.focus = Focus::DesktopPicker,
+            };
+            (
+                Model {
+                    form_state,
+                    last_response: Some(res),
+                    ..model
+                },
+                Effect::none(),
+            )
+        }
         Msg::FieldUpdate(field, input) => {
             model.fields[field as usize] = input;
             (model, Effect::none())
         }
         Msg::FocusOn(focus) => (Model { focus, ..model }, Effect::none()),
+        Msg::SubmitLogin => {
+            model
+                .req_tx
+                .send_async(greetd::Request::CreateSession {
+                    username: model.field(Field::Username).value().into(),
+                })
+                .await
+                .unwrap();
+            let form_state = FormState::CreatedSession;
+
+            (
+                Model {
+                    form_state,
+                    ..model
+                },
+                Effect::none(),
+            )
+        }
+        Msg::Nothing => (model, Effect::none()),
+        Msg::StartShell => {
+            println!("DONE");
+            model
+                .req_tx
+                .send_async(greetd::Request::StartSession {
+                    command: ["/bin/sh".into()].into(),
+                    env: [].into(),
+                })
+                .await
+                .unwrap();
+            std::process::exit(0)
+        }
     }
 }
