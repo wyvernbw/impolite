@@ -1,6 +1,6 @@
 use ratatui::style::Color;
 
-pub const PALETTE: [[Color; 14]; 8] = [
+pub const LIPGLOSS: [[Color; 14]; 8] = [
     [
         Color::from_u32(0xf25d94),
         Color::from_u32(0xf36c94),
