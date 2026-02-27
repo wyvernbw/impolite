@@ -518,12 +518,17 @@ async fn update(mut model: Model, msg: Msg) -> (Model, Effect<Msg>) {
             model
                 .req_tx
                 .send_async(greetd::Request::StartSession {
-                    command: ["/bin/sh".into()].into(),
+                    cmd: ["/bin/sh".into()].into(),
                     env: [].into(),
                 })
                 .await
                 .unwrap();
-            std::process::exit(0)
+            (
+                model,
+                Effect::new(async |tx| {
+                    tx.send_async(Msg::Quit).await.unwrap();
+                }),
+            )
         }
     }
 }
