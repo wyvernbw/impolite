@@ -236,7 +236,10 @@ async fn view(model: &Model) -> View {
                             return None;
                         }
                         match event {
-                            key!(Tab) => Some((Msg::FocusOn(Focus::PasswordField), Effect::none())),
+                            key!(Tab)
+                            | key!(Char('j' | 'J'), KeyModifiers::CONTROL)
+                            | key!(Down)
+                            | key!(Enter) => Some((Msg::FocusOn(Focus::PasswordField), Effect::none())),
                             _ => None
                         }
                     })
@@ -252,11 +255,14 @@ async fn view(model: &Model) -> View {
                             return None;
                         }
                         match event {
-                            key!(Tab) => Some((Msg::FocusOn(Focus::UsernameField), Effect::none())),
+                            key!(Tab)
+                            | key!(Char('k' | 'K'), KeyModifiers::CONTROL)
+                            | key!(Up) => Some((Msg::FocusOn(Focus::UsernameField), Effect::none())),
                             _ => None
                         }
                     })
                 />
+                <HelpSection Padding::new(0, 0, 4, 0)/>
             </Block>
         </Block>
     }
@@ -276,12 +282,16 @@ fn field_input(
     };
     let new_state = state.clone();
     let label_style = match focused {
-        true => Style::new().fg(LIPGLOSS[1][0]),
-        false => Style::new().fg(LIPGLOSS[5][2]).dim(),
+        true => Style::new().fg(LIPGLOSS[6][11]),
+        false => Style::new().dim(),
     };
     let input_style = match focused {
-        true => Style::new().fg(LIPGLOSS[2][1]),
-        false => Style::new(),
+        true => Style::new().bold(),
+        false => Style::new().dim().bold(),
+    };
+    let label = match focused {
+        true => format!("| {label}"),
+        false => format!("  {label}"),
     };
     ui! {
         <Block
@@ -302,6 +312,20 @@ fn field_input(
             >
                 "{value}"
             </Span>
+        </Block>
+    }
+}
+
+#[subview]
+fn help_section() -> View {
+    let bright = Color::from_u32(0x626262);
+    let dark = Color::from_u32(0x4e4e4e);
+    ui! {
+        <Block Direction::Horizontal>
+            <Span .style={Style::new().fg(bright)}>"↑↓ / Tab / ^J ^K "</Span>
+            <Span .style={Style::new().fg(dark)}>"navigate • "</Span>
+            <Span .style={Style::new().fg(bright)}>"Enter "</Span>
+            <Span .style={Style::new().fg(dark)}>"confirm "</Span>
         </Block>
     }
 }
